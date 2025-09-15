@@ -1,5 +1,10 @@
-#兼容所有情况的java代码
-package com.bankdetect;
+
+
+//TODO  20250915  18:58
+//      添加中文注释
+//      封装类
+
+package com.ruoyi.web.controller.imageProcessing;
 
 import org.apache.pdfbox.pdmodel.PDDocument;
 import org.apache.pdfbox.rendering.ImageType;
@@ -7,33 +12,34 @@ import org.apache.pdfbox.rendering.PDFRenderer;
 import org.opencv.core.*;
 import org.opencv.imgcodecs.Imgcodecs;
 import org.opencv.imgproc.Imgproc;
-import org.opencv.imgproc.Moments;
 
-import javax.imageio.ImageIO;
 import java.awt.image.BufferedImage;
 import java.io.File;
 import java.io.IOException;
 import java.util.*;
-import java.util.List;
 
 public class BankReceiptDetector {
-    
-    // 配置参数
-    private static final String PDF_PATH = "D:\\Yy\\Documents\\yuqing\\中行回单.pdf";
-    private static final String OUTPUT_DIR = "D:\\Yy\\Documents\\yuqing\\中行回单";
+
+    private static final String PDF_PATH = "D:\\work\\数据版\\银行回单\\中行回单.pdf";
+    private static final String OUTPUT_DIR = "D:\\work\\temp";
     private static final float DPI = 300f;
     private static final int TOP_OFFSET_MM = 10;
-    private static final int MIN_LOGO_AREA = 20;
+    private static final int MIN_LOGO_AREA = 10;
     private static final int CLUSTER_EPS = 15;
     private static final double LOGO_ROI_LEFT_RATIO = 0.0;
-    private static final double LOGO_ROI_RIGHT_RATIO = 1.0 / 2.0;
+    private static final double LOGO_ROI_RIGHT_RATIO = 0.5;
     private static final String OUTPUT_FORMAT = "PNG";
-    
+
     static {
-        // 加载OpenCV本地库
-        nu.pattern.OpenCV.loadLocally();
+        try {
+            String opencvDll = System.getProperty("user.dir") + "/ruoyi-admin/lib/opencv_java452.dll";
+            System.load(opencvDll);
+            System.out.println("DLL 加载成功: " + opencvDll);
+        } catch (Exception e) {
+            throw new RuntimeException("OpenCV DLL 加载失败: " + e.getMessage(), e);
+        }
     }
-    
+
     public static void main(String[] args) {
         try {
             new BankReceiptDetector().process();
@@ -41,291 +47,190 @@ public class BankReceiptDetector {
             e.printStackTrace();
         }
     }
-    
+
     public void process() throws IOException {
-        // 创建输出目录
         File outputDir = new File(OUTPUT_DIR);
-        if (!outputDir.exists()) {
-            outputDir.mkdirs();
-        }
-        
+        if (!outputDir.exists()) outputDir.mkdirs();
+
         PDDocument document = PDDocument.load(new File(PDF_PATH));
-        PDFRenderer pdfRenderer = new PDFRenderer(document);
+        PDFRenderer renderer = new PDFRenderer(document);
         int receiptCount = 0;
         int pxOffset = mmToPx(TOP_OFFSET_MM, DPI);
-        
+
         for (int pageIdx = 0; pageIdx < document.getNumberOfPages(); pageIdx++) {
             System.out.println("正在处理第 " + (pageIdx + 1) + " / " + document.getNumberOfPages() + " 页...");
-            
-            // 渲染PDF页面为图像
-            BufferedImage bufferedImage = pdfRenderer.renderImageWithDPI(pageIdx, DPI, ImageType.RGB);
-            Mat imgMat = bufferedImageToMat(bufferedImage);
-            Mat grayMat = new Mat();
-            Imgproc.cvtColor(imgMat, grayMat, Imgproc.COLOR_RGB2GRAY);
-            
-            // 检测Logo位置
-            List<Integer> logoTops = findLogoTops(imgMat, DPI);
+            BufferedImage bufImg = renderer.renderImageWithDPI(pageIdx, DPI, ImageType.RGB);
+            Mat img = bufferedImageToMat(bufImg);
+            Mat gray = new Mat();
+            Imgproc.cvtColor(img, gray, Imgproc.COLOR_RGB2GRAY);
+
+            List<Integer> logoTops = findLogoTops(img);
             if (logoTops.isEmpty()) {
                 System.out.println("  ⚠️ 未检测到Logo，跳过");
                 continue;
             }
-            
-            System.out.println("  ✅ 检测到 " + logoTops.size() + " 个Logo位置: " + logoTops);
-            
-            // 计算分割线
+
+            System.out.println("  ✅ 检测到Logo位置: " + logoTops);
+
             List<Integer> topLines = new ArrayList<>();
-            for (int top : logoTops) {
-                topLines.add(Math.max(0, top - pxOffset));
-            }
+            for (int top : logoTops) topLines.add(Math.max(0, top - pxOffset));
             Collections.sort(topLines);
-            
+
             List<Integer> bottomLines = new ArrayList<>();
-            for (int i = 0; i < topLines.size() - 1; i++) {
-                bottomLines.add(topLines.get(i + 1));
-            }
+            for (int i = 0; i < topLines.size() - 1; i++) bottomLines.add(topLines.get(i + 1));
             int lastStartY = topLines.get(topLines.size() - 1);
-            int lastBottom = detectBottomEdge(grayMat, lastStartY);
+            int lastBottom = detectBottomEdge(gray, lastStartY, img.cols() / 2);
             bottomLines.add(lastBottom);
-            
-            // 裁剪并保存
+
             for (int i = 0; i < topLines.size(); i++) {
                 int y1 = topLines.get(i);
                 int y2 = bottomLines.get(i);
-                
-                Rect cropRect = new Rect(0, y1, imgMat.cols(), y2 - y1);
-                Mat cropped = new Mat(imgMat, cropRect);
-                
-                int hCropped = cropped.rows();
-                int wCropped = cropped.cols();
-                
-                if (hCropped == 0 || wCropped == 0) {
-                    System.out.println("  ⚠️ 裁剪区域为空，跳过 (y1=" + y1 + ", y2=" + y2 + ")");
-                    continue;
-                }
-                
-                double aspectRatio = (double) wCropped / hCropped;
-                
-                if (aspectRatio > 10 || aspectRatio < 0.1) {
-                    System.out.printf("  ⚠️ 裁剪区域长宽比异常 (w=%d, h=%d, ratio=%.2f)，跳过%n", wCropped, hCropped, aspectRatio);
-                    continue;
-                }
-                
-                // 转换为BGR格式用于保存
-                Mat croppedBGR = new Mat();
-                Imgproc.cvtColor(cropped, croppedBGR, Imgproc.COLOR_RGB2BGR);
-                
-                String filename = String.format("receipt_page%d_%d.%s", 
-                    pageIdx + 1, i + 1, OUTPUT_FORMAT.toLowerCase());
+                Rect cropRect = new Rect(0, y1, img.cols(), y2 - y1);
+                Mat cropped = new Mat(img, cropRect);
+
+                int h = cropped.rows();
+                int w = cropped.cols();
+                if (h == 0 || w == 0) continue;
+
+                double aspectRatio = (double) w / h;
+                if (aspectRatio > 10 || aspectRatio < 0.1) continue;
+
+                Mat saveMat = new Mat();
+                Imgproc.cvtColor(cropped, saveMat, Imgproc.COLOR_RGB2BGR);
+
+                String filename = String.format("receipt_page%d_%d.%s", pageIdx + 1, i + 1, OUTPUT_FORMAT.toLowerCase());
                 String outputFile = new File(outputDir, filename).getAbsolutePath();
-                
-                Imgcodecs.imwrite(outputFile, croppedBGR);
+                Imgcodecs.imwrite(outputFile, saveMat);
                 receiptCount++;
-                System.out.printf("  保存: %s (高度: %dpx, 宽度: %dpx)%n", outputFile, y2 - y1, wCropped);
+                System.out.printf("  保存: %s (起始Y=%d, 结束Y=%d, 高度=%d, 宽度=%d, ratio=%.2f)%n",
+                        outputFile, y1, y2, y2 - y1, w, aspectRatio);
             }
+
         }
-        
+
         document.close();
-        System.out.println("\n✅ 完成！共分割出 " + receiptCount + " 个等高区域。");
+        System.out.println("\n✅ 完成！共分割出 " + receiptCount + " 个回单。");
     }
-    
+
     private static int mmToPx(int mm, float dpi) {
         return (int) (dpi * mm / 25.4);
     }
-    
+
     private Mat getColorMasks(Mat hsv) {
-        // 蓝色范围 - 扩大范围
-        Scalar lowerBlue = new Scalar(90, 30, 30);
-        Scalar upperBlue = new Scalar(150, 255, 255);
+        // Python 完全一致的 HSV 范围
         Mat maskBlue = new Mat();
-        Core.inRange(hsv, lowerBlue, upperBlue, maskBlue);
-        
-        // 红色范围（跨0度）- 扩大范围
-        Scalar lowerRed1 = new Scalar(0, 30, 30);
-        Scalar upperRed1 = new Scalar(15, 255, 255);
-        Scalar lowerRed2 = new Scalar(165, 30, 30);
-        Scalar upperRed2 = new Scalar(180, 255, 255);
-        
+        Core.inRange(hsv, new Scalar(100, 50, 50), new Scalar(140, 255, 255), maskBlue);
+
         Mat maskRed1 = new Mat();
         Mat maskRed2 = new Mat();
-        Core.inRange(hsv, lowerRed1, upperRed1, maskRed1);
-        Core.inRange(hsv, lowerRed2, upperRed2, maskRed2);
-        
+        Core.inRange(hsv, new Scalar(0, 50, 50), new Scalar(10, 255, 255), maskRed1);
+        Core.inRange(hsv, new Scalar(170, 50, 50), new Scalar(180, 255, 255), maskRed2);
         Mat maskRed = new Mat();
         Core.add(maskRed1, maskRed2, maskRed);
-        
-        // 绿色范围 - 扩大范围
-        Scalar lowerGreen = new Scalar(30, 30, 30);
-        Scalar upperGreen = new Scalar(90, 255, 255);
+
         Mat maskGreen = new Mat();
-        Core.inRange(hsv, lowerGreen, upperGreen, maskGreen);
-        
-        // 黄色范围 - 扩大范围
-        Scalar lowerYellow = new Scalar(15, 30, 30);
-        Scalar upperYellow = new Scalar(40, 255, 255);
+        Core.inRange(hsv, new Scalar(35, 50, 50), new Scalar(85, 255, 255), maskGreen);
+
         Mat maskYellow = new Mat();
-        Core.inRange(hsv, lowerYellow, upperYellow, maskYellow);
-        
-        // 自定义颜色 #009882 -> HSV大约 (69, 100%, 60%) - 扩大范围
-        Scalar lowerCustom = new Scalar(60, 50, 20);
-        Scalar upperCustom = new Scalar(80, 255, 150);
+        Core.inRange(hsv, new Scalar(20, 50, 50), new Scalar(35, 255, 255), maskYellow);
+
         Mat maskCustom = new Mat();
-        Core.inRange(hsv, lowerCustom, upperCustom, maskCustom);
-        
-        // 紫色/品红色范围 - 新增
-        Scalar lowerPurple = new Scalar(120, 30, 30);
-        Scalar upperPurple = new Scalar(170, 255, 255);
-        Mat maskPurple = new Mat();
-        Core.inRange(hsv, lowerPurple, upperPurple, maskPurple);
-        
-        // 合并所有掩码
-        Mat result = new Mat();
-        Core.add(maskBlue, maskRed, result);
-        Core.add(result, maskGreen, result);
-        Core.add(result, maskYellow, result);
-        Core.add(result, maskCustom, result);
-        Core.add(result, maskPurple, result);
-        
-        return result;
-    }
-    
-    private List<Integer> findLogoTops(Mat img, float dpi) {
-        int h = img.rows();
-        int w = img.cols();
-        int x1 = (int) (w * LOGO_ROI_LEFT_RATIO);
-        int x2 = (int) (w * LOGO_ROI_RIGHT_RATIO);
-        
-        // 提取ROI区域
-        Rect roiRect = new Rect(x1, 0, x2 - x1, h);
-        Mat roi = new Mat(img, roiRect);
-        
-        // 转换为HSV
-        Mat roiHsv = new Mat();
-        Imgproc.cvtColor(roi, roiHsv, Imgproc.COLOR_RGB2HSV);
-        
-        // 获取颜色掩码
-        Mat mask = getColorMasks(roiHsv);
-        
-        // 检查是否有颜色像素
-        if (Core.countNonZero(mask) == 0) {
-            System.out.println("  ⚠️ ROI内没有检测到指定颜色像素（可能颜色范围不匹配）");
-            return new ArrayList<>();
-        }
-        
-        // 形态学操作
+        Core.inRange(hsv, new Scalar(65, 90, 40), new Scalar(75, 255, 120), maskCustom);
+
+        Mat mask = new Mat();
+        Core.add(maskBlue, maskRed, mask);
+        Core.add(mask, maskGreen, mask);
+        Core.add(mask, maskYellow, mask);
+        Core.add(mask, maskCustom, mask);
+
+        // 形态学操作与 Python 保持一致
         Mat kernel = Imgproc.getStructuringElement(Imgproc.MORPH_RECT, new Size(5, 5));
         Imgproc.morphologyEx(mask, mask, Imgproc.MORPH_CLOSE, kernel);
         Imgproc.morphologyEx(mask, mask, Imgproc.MORPH_OPEN, kernel);
-        
-        // 查找轮廓
+
+        return mask;
+    }
+
+    private List<Integer> findLogoTops(Mat img) {
+        int h = img.rows();
+        int w = img.cols();
+        int x1 = 0;
+        int x2 = (int) (w * LOGO_ROI_RIGHT_RATIO);
+        Mat roi = new Mat(img, new Rect(x1, 0, x2 - x1, h));
+        Mat hsv = new Mat();
+        Imgproc.cvtColor(roi, hsv, Imgproc.COLOR_RGB2HSV);
+        Mat mask = getColorMasks(hsv);
+        if (Core.countNonZero(mask) == 0) {
+            System.out.println("  ⚠️ Mask为空，未检测到颜色区域");
+            return new ArrayList<>();
+        }
+
         List<MatOfPoint> contours = new ArrayList<>();
-        Mat hierarchy = new Mat();
-        Imgproc.findContours(mask, contours, hierarchy, Imgproc.RETR_EXTERNAL, Imgproc.CHAIN_APPROX_SIMPLE);
-        
-        if (contours.isEmpty()) {
-            System.out.println("  ⚠️ 颜色区域存在，但未形成有效轮廓（可能噪点太碎）");
-            return new ArrayList<>();
-        }
-        
+        Imgproc.findContours(mask, contours, new Mat(), Imgproc.RETR_EXTERNAL, Imgproc.CHAIN_APPROX_SIMPLE);
+
         List<Integer> rawTops = new ArrayList<>();
-        for (MatOfPoint contour : contours) {
+
+        System.out.printf("  [Java] 图像尺寸: %dx%d, ROI: x1=%d, x2=%d%n", h, w, x1, x2);
+        System.out.println("  [Java] Mask非零像素数量: " + Core.countNonZero(mask));
+        System.out.println("  检测到轮廓数量: " + contours.size());
+        for (int i = 0; i < contours.size(); i++) {
+            MatOfPoint contour = contours.get(i);
             double area = Imgproc.contourArea(contour);
-            
-            // 只保留最基本的面积过滤，放宽其他条件
-            if (area < MIN_LOGO_AREA) {
-                continue;
-            }
-            
-            Rect boundingRect = Imgproc.boundingRect(contour);
-            
-            // 放宽长宽比限制，允许更多形状
-            double aspectRatio = (double) boundingRect.width / boundingRect.height;
-            if (aspectRatio > 20 || aspectRatio < 0.05) { // 只过滤极端异常的形状
-                continue;
-            }
-            
-            rawTops.add(boundingRect.y);
-            System.out.println("  检测到Logo候选: y=" + boundingRect.y + ", 面积=" + (int)area + ", 长宽比=" + String.format("%.2f", aspectRatio));
+            if (area < MIN_LOGO_AREA) continue;
+
+            Rect rect = Imgproc.boundingRect(contour);
+            if (rect.x + rect.width > x2) continue; // 避免右侧杂色
+            double aspectRatio = (double) rect.width / rect.height;
+            if (aspectRatio > 20 || aspectRatio < 0.05) continue;
+
+            rawTops.add(rect.y);
+            System.out.printf("    轮廓%d: y=%d, area=%.2f, ratio=%.2f%n", i, rect.y, area, aspectRatio);
         }
-        
-        if (rawTops.isEmpty()) {
-            System.out.println("  ⚠️ 检测到的轮廓面积都小于阈值 MIN_LOGO_AREA=" + MIN_LOGO_AREA);
-            return new ArrayList<>();
-        }
-        
-        // 相邻聚类
+
         Collections.sort(rawTops);
+        System.out.println("  聚类前 rawTops: " + rawTops);
+
         List<Integer> uniqueTops = new ArrayList<>();
-        uniqueTops.add(rawTops.get(0));
-        
+        if (!rawTops.isEmpty()) uniqueTops.add(rawTops.get(0));
         for (int i = 1; i < rawTops.size(); i++) {
-            int current = rawTops.get(i);
-            int last = uniqueTops.get(uniqueTops.size() - 1);
-            if (Math.abs(current - last) > CLUSTER_EPS) {
-                uniqueTops.add(current);
-            }
+            if (Math.abs(rawTops.get(i) - uniqueTops.get(uniqueTops.size() - 1)) > CLUSTER_EPS)
+                uniqueTops.add(rawTops.get(i));
         }
-        
-        if (uniqueTops.isEmpty()) {
-            System.out.println("  ⚠️ 所有候选Logo位置在聚类后被合并或过滤掉");
-            return new ArrayList<>();
-        }
-        
+
+        System.out.println("  聚类后 uniqueTops: " + uniqueTops);
         return uniqueTops;
     }
-    
-    private int detectBottomEdge(Mat grayImg, int startY) {
-        int height = grayImg.rows();
-        int width = grayImg.cols();
-        int minTextDensity = 5;
-        
-        // 计算水平投影（每行非白色像素数量）
-        int[] hProj = new int[height];
-        for (int y = 0; y < height; y++) {
-            int count = 0;
-            for (int x = 0; x < width; x++) {
-                double[] pixel = grayImg.get(y, x);
-                if (pixel[0] < 200) { // 非白色像素
-                    count++;
-                }
-            }
-            hProj[y] = count;
-        }
-        
-        // 找到有文本的行
-        List<Integer> validRows = new ArrayList<>();
-        for (int y = 0; y < height; y++) {
-            if (hProj[y] > minTextDensity) {
-                validRows.add(y);
-            }
-        }
-        
-        if (validRows.isEmpty()) {
-            return height;
-        }
-        
-        // 获取最后一行有文本的位置
-        int lastTextRow = validRows.get(validRows.size() - 1);
-        
-        // 添加10mm的边距
+
+
+    private int detectBottomEdge(Mat grayImg, int startY, int roiWidth) {
+        int h = grayImg.rows();
         int margin = mmToPx(10, DPI);
-        return Math.min(height, lastTextRow + margin);
+
+        for (int y = h - 1; y >= startY; y--) {
+            int count = 0;
+            for (int x = 0; x < roiWidth; x++) { // 只扫描 ROI 左半部分
+                if (grayImg.get(y, x)[0] < 200) count++;
+            }
+            if (count > 5) return Math.min(h, y + margin);
+        }
+        return h;
     }
-    
-    private Mat bufferedImageToMat(BufferedImage bufferedImage) {
-        byte[] pixels = new byte[bufferedImage.getWidth() * bufferedImage.getHeight() * 3];
-        int index = 0;
-        
-        for (int y = 0; y < bufferedImage.getHeight(); y++) {
-            for (int x = 0; x < bufferedImage.getWidth(); x++) {
-                int rgb = bufferedImage.getRGB(x, y);
-                pixels[index++] = (byte) ((rgb >> 16) & 0xFF); // R
-                pixels[index++] = (byte) ((rgb >> 8) & 0xFF);  // G
-                pixels[index++] = (byte) (rgb & 0xFF);         // B
+
+    private Mat bufferedImageToMat(BufferedImage img) {
+        int w = img.getWidth();
+        int h = img.getHeight();
+        Mat mat = new Mat(h, w, CvType.CV_8UC3);
+        byte[] data = new byte[w * h * 3];
+        int idx = 0;
+        for (int y = 0; y < h; y++) {
+            for (int x = 0; x < w; x++) {
+                int rgb = img.getRGB(x, y);
+                data[idx++] = (byte) ((rgb >> 16) & 0xFF);
+                data[idx++] = (byte) ((rgb >> 8) & 0xFF);
+                data[idx++] = (byte) (rgb & 0xFF);
             }
         }
-        
-        Mat mat = new Mat(bufferedImage.getHeight(), bufferedImage.getWidth(), CvType.CV_8UC3);
-        mat.put(0, 0, pixels);
+        mat.put(0, 0, data);
         return mat;
     }
 }
